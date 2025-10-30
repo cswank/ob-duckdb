@@ -437,7 +437,7 @@ directives are properly translated to DuckDB's native configuration system."
       (when headers   (insert (format ".headers %s\n"   (if (string= headers "off") "off" "on"))))
       (when echo      (insert (format ".echo %s\n"      (if (string= echo    "off") "off" "on"))))
       (when bail      (insert (format ".bail %s\n"      (if (string= bail    "off") "off" "on"))))
-      (when use       (insert (format "USE %s;\n"      use))
+      (when use       (insert (format "USE %s;\n"      use)))
 
       ;; Return the buffer contents if we added any commands
       (when (> (buffer-size) 0)
