@@ -583,22 +583,60 @@ Also see `org-babel-duckdb--validate-motherduck-params' for validation."
      ;; In-memory database
      (t ""))))
 
-(defun org-babel-duckdb--build-motherduck-prelude (params)
-  "Build SQL prelude that attaches MotherDuck database from PARAMS.
+(defun org-babel-duckdb--build-motherduck-attach (params)
+  "Build the per-connection MotherDuck setup SQL from PARAMS.
 
 Returns SQL string or nil when :md is not set.
 
-The prelude installs and loads the motherduck extension, sets the
-auth token, and attaches the database. Uses ATTACH IF NOT EXISTS
-so the prelude is safe to run repeatedly in a session.
+Installs and loads the motherduck extension, sets the auth token,
+and attaches the full MotherDuck workspace.
+
+Attaching with bare `md:' enters workspace mode, mounting every
+database you can access - including databases shared with you - as
+catalogs. Attaching `md:DATABASE' instead enters single mode,
+which does not load your workspace and therefore cannot see shared
+databases (see URL
+`https://motherduck.com/docs/key-tasks/authenticating-and-connecting-to-motherduck/attach-modes/').
+
+This is connection-level setup and must run exactly once per
+process. One-shot (non-session) executions get it prepended to the
+body via `org-babel-duckdb--build-motherduck-prelude'; long-lived
+session processes run it once at startup in
+`org-babel-duckdb-initiate-session', which is why re-running it
+would otherwise error with the workspace already attached.
 
 Resolves token via `org-babel-duckdb--resolve-motherduck-token'."
   (let ((md-db (cdr (assq :md params))))
     (when md-db
       (let ((token (org-babel-duckdb--resolve-motherduck-token params)))
         (format
-         "INSTALL motherduck;\nLOAD motherduck;\nSET motherduck_token='%s';\nATTACH IF NOT EXISTS 'md:%s';\n"
-         token md-db)))))
+         "INSTALL motherduck;\nLOAD motherduck;\nSET motherduck_token='%s';\nATTACH 'md:';\n"
+         token)))))
+
+(defun org-babel-duckdb--build-motherduck-prelude (params &optional attach-done)
+  "Build SQL prelude that connects to MotherDuck from PARAMS.
+
+Returns SQL string or nil when :md is not set.
+
+When ATTACH-DONE is nil the full prelude is emitted: the
+connection setup from `org-babel-duckdb--build-motherduck-attach'
+followed by a `USE DATABASE' that selects the requested database
+as the default catalog. This form is suitable for a fresh one-shot
+process.
+
+When ATTACH-DONE is non-nil the workspace attach is assumed to have
+already run for this connection - as it has for session processes,
+which attach once at startup in `org-babel-duckdb-initiate-session'
+- and only the `USE DATABASE' statement is emitted. `USE' is
+idempotent and cheap, so it runs per block and lets successive
+blocks in one session target different databases.
+
+Resolves token via `org-babel-duckdb--resolve-motherduck-token'."
+  (let ((md-db (cdr (assq :md params))))
+    (when md-db
+      (concat (unless attach-done
+                (org-babel-duckdb--build-motherduck-attach params))
+              (format "USE %s;\n" md-db)))))
 
 ;;;; Queue Management Functions
 (defun org-babel-duckdb--collect-queue-entries ()
@@ -1255,7 +1293,22 @@ For session management, see `org-babel-duckdb-delete-session' and
               (unless ready
                 (kill-process process)
                 (error "DuckDB session %s failed to initialize within %d seconds"
-                       session-name timeout))))))
+                       session-name timeout)))
+
+            ;; Attach the MotherDuck workspace once for this fresh
+            ;; process. Session bodies only emit a per-block USE (see
+            ;; `org-babel-duckdb--build-motherduck-prelude'), so the
+            ;; workspace must be attached here; re-running the attach on
+            ;; a live session would error with it already attached.
+            (let ((md-attach (org-babel-duckdb--build-motherduck-attach params)))
+              (when md-attach
+                (process-send-string process md-attach)
+                ;; Drain the setup output so it does not bleed into the
+                ;; first block's results.
+                (let ((waited 0))
+                  (while (and (< waited 30)
+                              (accept-process-output process 0.2))
+                    (setq waited (+ waited 0.2)))))))))
 
       buffer)))
 
@@ -2388,7 +2441,12 @@ When disabled, only async executions tracked minimally via
 
     (let* ((expanded-body (org-babel-expand-body:duckdb body params))
            (dot-commands (org-babel-duckdb-process-params params))
-           (md-prelude (org-babel-duckdb--build-motherduck-prelude params))
+           ;; Session processes attach the MotherDuck workspace once at
+           ;; startup (see `org-babel-duckdb-initiate-session'), so only
+           ;; the per-block USE is needed here; one-shot processes get the
+           ;; full attach.
+           (use-session-p (and session (not (string= session "none"))))
+           (md-prelude (org-babel-duckdb--build-motherduck-prelude params use-session-p))
            (combined-body (if dot-commands
                               (concat dot-commands "\n" expanded-body)
                             expanded-body))
